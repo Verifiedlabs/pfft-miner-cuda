@@ -82,12 +82,21 @@ Run the miner against a pool of wallets — each round rotates to the next walle
 
 ### Auto-generate N wallets
 
+**Interactive (asks how many):**
 ```bash
 mkdir wallets
+PFFT_WALLETS_DIR=./wallets python3 pfft_miner.py
+# Prompts: "How many wallets to create? [default: 1]:"
+```
+
+**Non-interactive (pre-set count):**
+```bash
 PFFT_WALLETS_DIR=./wallets PFFT_AUTO_CREATE_WALLETS=5 python3 pfft_miner.py
 ```
 
-First run creates `wallets/wallet_1.json` … `wallet_5.json`. Fund each address with ETH, then re-run.
+First run creates `wallets/wallet_1.json` … `wallet_N.json`. Fund each address with ETH, then re-run.
+
+> Once wallets exist in the folder, the miner loads all of them — the create prompt only runs if the folder is empty.
 
 ### Import existing wallets
 

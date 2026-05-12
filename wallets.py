@@ -72,7 +72,7 @@ def _save_wallet_json(wallet, path: Path):
 
 
 def load_wallets(Account, default_path: str, wallets_dir_env: str = "PFFT_WALLETS_DIR",
-                 auto_create_count: int = 1) -> WalletPool:
+                 auto_create_count: int = 1, interactive: bool = True) -> WalletPool:
     dir_path = os.environ.get(wallets_dir_env)
     wallets: List[Wallet] = []
 
@@ -87,8 +87,11 @@ def load_wallets(Account, default_path: str, wallets_dir_env: str = "PFFT_WALLET
                 print(f"  ⚠️  Skip {f.name}: {e}")
 
         if not wallets:
-            print(f"  No wallets in {d}, creating {auto_create_count}...")
-            for i in range(auto_create_count):
+            count = auto_create_count
+            if interactive and os.environ.get("PFFT_AUTO_CREATE_WALLETS") is None:
+                count = _ask_wallet_count(default=auto_create_count)
+            print(f"  No wallets in {d}, creating {count}...")
+            for i in range(count):
                 acc = Account.create()
                 path = d / f"wallet_{i+1}.json"
                 _save_wallet_json(acc, path)
@@ -106,3 +109,28 @@ def load_wallets(Account, default_path: str, wallets_dir_env: str = "PFFT_WALLET
         wallets.append(Wallet(acc, source=str(single_path)))
 
     return WalletPool(wallets)
+
+
+def _ask_wallet_count(default: int = 1) -> int:
+    import sys
+    if not sys.stdin.isatty():
+        return default
+    while True:
+        try:
+            raw = input(f"\n  How many wallets to create? [default: {default}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+        if not raw:
+            return default
+        try:
+            n = int(raw)
+            if n < 1:
+                print("  Must be >= 1")
+                continue
+            if n > 100:
+                print("  Too many (max 100)")
+                continue
+            return n
+        except ValueError:
+            print("  Please enter a number")
