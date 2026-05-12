@@ -2,7 +2,7 @@
 set -e
 
 if ! command -v python3 >/dev/null; then
-    echo "Python not found. Install: sudo apt install python3 python3-pip python3-venv"
+    echo "Python not found. Install: sudo apt install python3 python3-pip python3-venv python3-full"
     exit 1
 fi
 
@@ -12,7 +12,7 @@ if ! nvidia-smi >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "GPU detected:"
+echo "GPU(s) detected:"
 nvidia-smi -L
 
 if ! command -v nvcc >/dev/null; then
@@ -24,12 +24,26 @@ if ! command -v nvcc >/dev/null; then
     echo "  sudo dpkg -i cuda-keyring_1.1-1_all.deb"
     echo "  sudo apt update && sudo apt install -y cuda-toolkit-12-6"
     echo ""
-    echo "Continuing install (pip wheels)..."
-    echo ""
 fi
+
+VENV_DIR="${VENV_DIR:-.venv}"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating venv at $VENV_DIR..."
+    if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
+        echo "venv creation failed. Install python3-venv:"
+        echo "  sudo apt install -y python3-venv python3-full"
+        exit 1
+    fi
+fi
+
+source "$VENV_DIR/bin/activate"
 
 python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 
 echo ""
-echo "Installed. Run: python3 pfft_miner.py"
+echo "Installed in $VENV_DIR"
+echo ""
+echo "Run miner:"
+echo "  source $VENV_DIR/bin/activate"
+echo "  python3 pfft_miner.py"

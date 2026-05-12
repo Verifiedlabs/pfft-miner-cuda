@@ -62,7 +62,16 @@ git clone https://github.com/Verifiedlabs/pfft-miner-cuda.git
 cd pfft-miner-cuda
 chmod +x install.sh
 ./install.sh
+
+source .venv/bin/activate
 python3 pfft_miner.py
+```
+
+The installer creates a Python venv at `.venv/` automatically (required on Ubuntu 22.04+ due to PEP 668).
+
+If venv creation fails:
+```bash
+sudo apt install -y python3-venv python3-full
 ```
 
 First run auto-generates `wallet.json` with a fresh Ethereum wallet. Fund it with ~0.001 ETH (enough for ~50 mints) and run again.
