@@ -37,6 +37,7 @@ GAS_LIMIT = 200000
 PAUSE_BETWEEN_ROUNDS = 5
 USE_GPU = os.environ.get("PFFT_GPU", "1") not in ("0", "false", "False", "")
 GPU_BATCH = int(os.environ.get("PFFT_GPU_BATCH", 1 << 22))
+GPU_IDS = os.environ.get("PFFT_GPU_IDS", "")
 AUTO_CREATE_WALLETS = int(os.environ.get("PFFT_AUTO_CREATE_WALLETS", 1))
 MIN_ETH_FOR_MINT = 0.00005
 WALLET_CAP_PFFT = 10_000
@@ -197,7 +198,121 @@ signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
 
+def _worker_mine(gpu_id: int, wallet_keys: list, gpu_batch: int, use_gpu: bool, log_prefix: str):
+    import signal as _signal
+    from web3 import Web3
+    from eth_account import Account
+    from wallets import Wallet, WalletPool
+
+    worker_running = {"v": True}
+
+    def _stop(sig, frame):
+        worker_running["v"] = False
+
+    _signal.signal(_signal.SIGINT, _stop)
+    _signal.signal(_signal.SIGTERM, _stop)
+
+    w3_local = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
+    globals()["w3"] = w3_local
+    contract = load_contract(w3_local)
+
+    wallets_obj = [Wallet(Account.from_key(k), source=f"worker-{gpu_id}") for k in wallet_keys]
+    pool = WalletPool(wallets_obj)
+
+    gpu = None
+    if use_gpu:
+        try:
+            from gpu_solver import GPUSolver
+            gpu = GPUSolver(batch_size=gpu_batch, device_id=gpu_id)
+            print(f"{log_prefix} GPU #{gpu_id} ({gpu.gpu_name}) ready, batch={gpu_batch:,}")
+        except Exception as e:
+            print(f"{log_prefix} GPU #{gpu_id} init failed: {e}")
+            return
+
+    round_num = 0
+    mints = 0
+    pfft_total = 0.0
+    start = time.time()
+
+    while worker_running["v"]:
+        round_num += 1
+        wo = pool.next_available()
+        if wo is None:
+            if not pool.available():
+                print(f"{log_prefix} All wallets exhausted, worker done.")
+                break
+            time.sleep(5)
+            continue
+
+        wallet = wo.account
+        try:
+            s = get_status(contract, wallet.address)
+            if s['total_minted'] >= s['max_supply']:
+                print(f"{log_prefix} Max supply reached.")
+                break
+            if s['wallet_minted'] >= WALLET_CAP_PFFT * 1e18:
+                print(f"{log_prefix} {wallet.address[:10]}... capped.")
+                wo.skip(10**9, "capped")
+                continue
+            eth_bal = w3_local.eth.get_balance(wallet.address) / 1e18
+            if eth_bal < MIN_ETH_FOR_MINT:
+                print(f"{log_prefix} {wallet.address[:10]}... low ETH ({eth_bal:.6f}), skip 5min")
+                wo.skip(300, "no_eth")
+                continue
+        except Exception as e:
+            print(f"{log_prefix} Status error: {e}")
+            time.sleep(15)
+            continue
+
+        print(f"{log_prefix} Round #{round_num} | {wallet.address[:10]}... | {s['difficulty_bits']}-bit")
+        challenge = get_challenge(contract, wallet.address)
+
+        if gpu is not None:
+            nonce, _ = gpu.solve(challenge, s['target'], lambda: worker_running["v"])
+        else:
+            nonce, _ = solve_pow(challenge, s['target'])
+
+        if nonce is None:
+            continue
+
+        try:
+            if not contract.functions.isValidPow(wallet.address, nonce).call():
+                print(f"{log_prefix} Nonce stale, re-mining...")
+                continue
+        except Exception:
+            pass
+
+        if submit_mint(w3_local, wallet, contract, nonce):
+            mints += 1
+            earned = s['next_mint'] / 1e18
+            pfft_total += earned
+            wo.mints_this_session += 1
+            wo.pfft_earned += earned
+            print(f"{log_prefix} +{earned:,.2f} PFFT (worker total: {pfft_total:,.2f}, {mints} mints)")
+
+        if worker_running["v"]:
+            time.sleep(PAUSE_BETWEEN_ROUNDS)
+
+    elapsed = time.time() - start
+    print(f"{log_prefix} DONE: {mints} mints, {pfft_total:,.2f} PFFT in {elapsed/60:.1f} min")
+
+
+def _detect_gpus():
+    try:
+        import cupy as cp
+        n = cp.cuda.runtime.getDeviceCount()
+        names = []
+        for i in range(n):
+            p = cp.cuda.runtime.getDeviceProperties(i)
+            names.append(p["name"].decode() if isinstance(p["name"], bytes) else str(p["name"]))
+        return list(range(n)), names
+    except Exception as e:
+        print(f"⚠️  GPU detection failed: {e}")
+        return [], []
+
+
 def main():
+    import multiprocessing as mp
     from web3 import Web3
     from eth_account import Account
 
@@ -207,36 +322,38 @@ def main():
     print(f"  RPC: {RPC}")
     print("=" * 60)
 
-    gpu = None
-    if USE_GPU:
-        try:
-            from gpu_solver import GPUSolver
-            gpu = GPUSolver(batch_size=GPU_BATCH)
-            print(f"🚀 GPU solver enabled (batch={GPU_BATCH:,})")
-        except Exception as e:
-            print(f"⚠️  GPU init failed, falling back to CPU: {e}")
-            gpu = None
+    if GPU_IDS.strip():
+        gpu_ids = [int(x.strip()) for x in GPU_IDS.split(",") if x.strip()]
+        gpu_names = [f"#{i}" for i in gpu_ids]
+        print(f"🎯 Using GPUs: {gpu_ids} (from PFFT_GPU_IDS)")
+    elif USE_GPU:
+        gpu_ids, gpu_names = _detect_gpus()
+        if gpu_ids:
+            print(f"🎯 Auto-detected {len(gpu_ids)} GPU(s):")
+            for i, n in zip(gpu_ids, gpu_names):
+                print(f"   [{i}] {n}")
+        else:
+            print("⚠️  No CUDA GPUs found, will run CPU-only worker.")
     else:
+        gpu_ids, gpu_names = [], []
         print("ℹ️  GPU disabled (PFFT_GPU=0), using CPU")
 
-    # Connect
-    global w3
-    w3 = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
-    if not w3.is_connected():
+    w3_main = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
+    if not w3_main.is_connected():
         print("❌ Cannot connect to RPC")
         sys.exit(1)
-    print(f"✅ Connected | Block #{w3.eth.block_number}")
+    print(f"✅ Connected | Block #{w3_main.eth.block_number}")
 
     from wallets import load_wallets
     pool = load_wallets(Account, WALLET_FILE, auto_create_count=AUTO_CREATE_WALLETS)
     print(f"\n👛 Loaded {len(pool)} wallet(s):")
     for w in pool.wallets:
-        eth_bal = w3.eth.get_balance(w.address) / 1e18
+        eth_bal = w3_main.eth.get_balance(w.address) / 1e18
         marker = "⚠️ " if eth_bal < MIN_ETH_FOR_MINT else "  "
         print(f"   {marker}{w.address}  ETH: {eth_bal:.6f}")
 
-    contract = load_contract(w3)
-
+    globals()["w3"] = w3_main
+    contract = load_contract(w3_main)
     head = pool.wallets[0]
     s = get_status(contract, head.address)
     print(f"\n📊 Contract:")
@@ -244,100 +361,46 @@ def main():
     print(f"   Next mint: ~{s['next_mint']/1e18:,.2f} PFFT")
     print(f"   Difficulty: {s['hex_zeros']} hex zeros ({s['difficulty_bits']}-bit)")
 
-    round_num = 0
-    total_minted_count = 0
-    total_pfft_earned = 0
+    num_workers = len(gpu_ids) if gpu_ids else 1
+    all_keys = ["0x" + w.account.key.hex() if not w.account.key.hex().startswith("0x") else w.account.key.hex()
+                for w in pool.wallets]
+    buckets = [[] for _ in range(num_workers)]
+    for idx, k in enumerate(all_keys):
+        buckets[idx % num_workers].append(k)
+
+    print(f"\n🔧 Spawning {num_workers} worker process(es):")
+    for i, b in enumerate(buckets):
+        gid = gpu_ids[i] if gpu_ids else -1
+        tag = f"GPU#{gid}" if gid >= 0 else "CPU"
+        print(f"   Worker {i} [{tag}]: {len(b)} wallet(s)")
+
+    procs = []
+    for i in range(num_workers):
+        gid = gpu_ids[i] if gpu_ids else -1
+        prefix = f"[GPU#{gid}]" if gid >= 0 else "[CPU]"
+        use_gpu_flag = USE_GPU and gid >= 0
+        p = mp.Process(
+            target=_worker_mine,
+            args=(max(gid, 0), buckets[i], GPU_BATCH, use_gpu_flag, prefix),
+            daemon=False,
+        )
+        p.start()
+        procs.append(p)
+
     global_start = time.time()
-
-    while running:
-        round_num += 1
-
-        wallet_obj = pool.next_available()
-        if wallet_obj is None:
-            avail = pool.available()
-            if not avail:
-                print("\n  🏁 All wallets are skipped/capped. Ending session.")
-                break
-            time.sleep(5)
-            continue
-
-        wallet = wallet_obj.account
-        print(f"\n{'─'*60}")
-        print(f"  Round #{round_num} — wallet {wallet.address[:10]}... ({pool.wallets.index(wallet_obj)+1}/{len(pool)})")
-        print(f"{'─'*60}")
-
-        try:
-            s = get_status(contract, wallet.address)
-            print(f"  Supply: {s['total_minted']/1e18:,.0f} ({s['progress']:.1f}%) | "
-                  f"Next: ~{s['next_mint']/1e18:,.2f} PFFT | "
-                  f"Diff: {s['difficulty_bits']}-bit")
-
-            if s['total_minted'] >= s['max_supply']:
-                print("  🏁 Max supply reached!")
-                break
-            if s['wallet_minted'] >= WALLET_CAP_PFFT * 1e18:
-                print(f"  🏁 Wallet capped ({WALLET_CAP_PFFT:,} PFFT). Skipping permanently.")
-                wallet_obj.skip(10**9, "capped")
-                continue
-
-            eth_bal = w3.eth.get_balance(wallet.address) / 1e18
-            if eth_bal < MIN_ETH_FOR_MINT:
-                print(f"  ⚠️  ETH too low ({eth_bal:.6f}). Skipping for 5 min.")
-                wallet_obj.skip(300, "no_eth")
-                continue
-        except Exception as e:
-            print(f"  ⚠️  Status error: {e}, retrying in 15s...")
-            time.sleep(15)
-            continue
-
-        challenge = get_challenge(contract, wallet.address)
-
-        print(f"  ⛏️  Mining ({s['difficulty_bits']}-bit)...")
-        t0 = time.time()
-        if gpu is not None:
-            nonce, h = gpu.solve(challenge, s['target'], lambda: running)
-        else:
-            nonce, h = solve_pow(challenge, s['target'])
-
-        if nonce is None:
-            print("  Failed, retrying...")
-            continue
-
-        mining_time = time.time() - t0
-
-        try:
-            is_valid = contract.functions.isValidPow(wallet.address, nonce).call()
-            if not is_valid:
-                print("  ⚠️  Nonce invalid on-chain (supply changed?), re-mining...")
-                continue
-        except Exception as e:
-            print(f"  ⚠️  Verify error: {e}, submitting anyway...")
-
-        success = submit_mint(w3, wallet, contract, nonce)
-        if success:
-            total_minted_count += 1
-            earned = s['next_mint'] / 1e18
-            total_pfft_earned += earned
-            wallet_obj.mints_this_session += 1
-            wallet_obj.pfft_earned += earned
-            print(f"  💰 +{earned:,.2f} PFFT | Wallet total: {wallet_obj.pfft_earned:,.2f} | Session: {total_pfft_earned:,.2f} from {total_minted_count} mints across {len(pool)} wallet(s)")
-
-        elapsed = time.time() - global_start
-        print(f"\n  📈 Session: {total_minted_count} mints | {total_pfft_earned:,.2f} PFFT | {elapsed/60:.1f} min")
-
-        if running:
-            print(f"  ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")
-            time.sleep(PAUSE_BETWEEN_ROUNDS)
+    try:
+        for p in procs:
+            p.join()
+    except KeyboardInterrupt:
+        print("\n⚠️  Stopping all workers...")
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=10)
 
     print(f"\n{'='*60}")
-    print(f"  Session Summary")
-    print(f"  Mints: {total_minted_count}")
-    print(f"  PFFT earned: {total_pfft_earned:,.2f}")
-    print(f"  Runtime: {(time.time()-global_start)/60:.1f} min")
-    print(f"\n  Per-wallet breakdown:")
-    for w in pool.wallets:
-        if w.mints_this_session > 0:
-            print(f"    {w.address}: {w.mints_this_session} mints, {w.pfft_earned:,.2f} PFFT")
+    print(f"  Session done in {(time.time()-global_start)/60:.1f} min")
     print(f"{'='*60}")
 
 

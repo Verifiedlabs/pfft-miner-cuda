@@ -101,6 +101,45 @@ Each file just needs a `private_key_hex` field. The miner picks them all up and 
 | Wallet minted ≥ 10,000 PFFT | Skip permanently (capped) |
 | All wallets skipped | End session |
 
+## Multi-GPU support
+
+If you have multiple NVIDIA GPUs (e.g. 2x RTX 4070), the miner auto-detects them and spawns one worker process per GPU. Each worker mines independently with its own slice of the wallet pool — throughput scales linearly.
+
+### Auto-detect all GPUs (default)
+
+```bash
+PFFT_WALLETS_DIR=./wallets PFFT_AUTO_CREATE_WALLETS=10 python3 pfft_miner.py
+```
+
+On a 2-GPU box with 10 wallets:
+- GPU #0 gets wallets 1, 3, 5, 7, 9
+- GPU #1 gets wallets 2, 4, 6, 8, 10
+- Both mine simultaneously at full hashrate
+
+Expected output:
+```
+🎯 Auto-detected 2 GPU(s):
+   [0] NVIDIA GeForce RTX 4070
+   [1] NVIDIA GeForce RTX 4070
+🔧 Spawning 2 worker process(es):
+   Worker 0 [GPU#0]: 5 wallet(s)
+   Worker 1 [GPU#1]: 5 wallet(s)
+[GPU#0] GPU #0 (NVIDIA GeForce RTX 4070) ready, batch=16,777,216
+[GPU#1] GPU #1 (NVIDIA GeForce RTX 4070) ready, batch=16,777,216
+[GPU#0] Round #1 | 0xabc... | 32-bit
+[GPU#1] Round #1 | 0xdef... | 32-bit
+...
+```
+
+### Use specific GPUs only
+
+```bash
+PFFT_GPU_IDS=0,2 python3 pfft_miner.py    # Only GPU 0 and 2
+PFFT_GPU_IDS=1 python3 pfft_miner.py      # Only GPU 1
+```
+
+Check GPU IDs with `nvidia-smi -L`.
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -111,6 +150,7 @@ Each file just needs a `private_key_hex` field. The miner picks them all up and 
 | `PFFT_AUTO_CREATE_WALLETS` | `1` | Auto-create N wallets when `PFFT_WALLETS_DIR` is empty |
 | `PFFT_GPU` | `1` | Set `0` to force CPU fallback |
 | `PFFT_GPU_BATCH` | `16777216` | GPU batch size (2^24). Raise to `33554432` on 3080+ |
+| `PFFT_GPU_IDS` | _(auto-detect all)_ | Comma-separated GPU IDs (e.g. `0,1,2`) |
 
 Set via env var before launch, or create `.env`:
 ```bash

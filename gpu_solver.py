@@ -185,13 +185,15 @@ def _u64_be(b: bytes) -> int:
 
 
 class GPUSolver:
-    def __init__(self, batch_size: int = 1 << 24, threads_per_block: int = 256):
+    def __init__(self, batch_size: int = 1 << 24, threads_per_block: int = 256, device_id: int = 0):
+        self.device_id = device_id
+        cp.cuda.Device(device_id).use()
         self.module = cp.RawModule(code=_CUDA_KERNEL, backend="nvcc")
         self.kernel = self.module.get_function("mine_kernel")
         self.batch_size = batch_size
         self.threads = threads_per_block
         self.blocks = batch_size // threads_per_block
-        props = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
+        props = cp.cuda.runtime.getDeviceProperties(device_id)
         self.gpu_name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
 
     def solve(self, challenge: bytes, target: int, running_flag) -> tuple:
