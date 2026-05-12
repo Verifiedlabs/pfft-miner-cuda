@@ -121,9 +121,11 @@ Each file just needs a `private_key_hex` field. The miner picks them all up and 
 
 ## Multi-GPU support
 
-If you have multiple NVIDIA GPUs (e.g. 2x RTX 4070), the miner auto-detects them and spawns one worker process per GPU. Each worker mines independently with its own slice of the wallet pool — throughput scales linearly.
+If you have multiple NVIDIA GPUs (e.g. 2x RTX 4070), the miner auto-detects them and spawns one worker process per GPU. Two modes, picked automatically based on wallet count vs GPU count:
 
-### Auto-detect all GPUs (default)
+### Parallel mode (wallets ≥ GPUs)
+
+Each GPU mines independently with its own slice of the wallet pool — throughput scales linearly.
 
 ```bash
 PFFT_WALLETS_DIR=./wallets PFFT_AUTO_CREATE_WALLETS=10 python3 pfft_miner.py
@@ -134,20 +136,27 @@ On a 2-GPU box with 10 wallets:
 - GPU #1 gets wallets 2, 4, 6, 8, 10
 - Both mine simultaneously at full hashrate
 
-Expected output:
+### Cooperative mode (wallets < GPUs)
+
+All GPUs gang up on **one wallet per round**. Each GPU searches a disjoint slice of the nonce space — first to find a valid nonce wins. Round-robins through wallets.
+
+Triggered automatically when you have fewer wallets than GPUs:
+
+```bash
+# 6x RTX 3090 + 1 wallet → all 6 GPUs mine same challenge together
+PFFT_WALLETS_DIR=./wallets PFFT_AUTO_CREATE_WALLETS=1 python3 pfft_miner.py
 ```
-🎯 Auto-detected 2 GPU(s):
-   [0] NVIDIA GeForce RTX 4070
-   [1] NVIDIA GeForce RTX 4070
-🔧 Spawning 2 worker process(es):
-   Worker 0 [GPU#0]: 5 wallet(s)
-   Worker 1 [GPU#1]: 5 wallet(s)
-[GPU#0] GPU #0 (NVIDIA GeForce RTX 4070) ready, batch=16,777,216
-[GPU#1] GPU #1 (NVIDIA GeForce RTX 4070) ready, batch=16,777,216
-[GPU#0] Round #1 | 0xabc... | 32-bit
-[GPU#1] Round #1 | 0xdef... | 32-bit
-...
+
+Output:
 ```
+🤝 Cooperative mode: 1 wallet(s) < 6 GPUs
+   All GPUs will mine the same challenge in parallel (first-to-find wins)
+🎯 Round #1 | wallet 0xabc... | 32-bit | ALL 6 GPUs
+  ✅ GPU#2 found nonce=9283742 in 0.4s
+  💰 +120.5 PFFT
+```
+
+Use when you want maximum speed on a single wallet (~6x solve time reduction on 6 GPUs).
 
 ### Use specific GPUs only
 

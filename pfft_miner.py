@@ -326,6 +326,189 @@ def _worker_mine(gpu_id: int, wallet_keys: list, gpu_batch: int, use_gpu: bool, 
     print(f"{log_prefix} DONE: {mints} mints, {pfft_total:,.2f} PFFT in {elapsed/60:.1f} min")
 
 
+def _coop_gpu_worker(gpu_id: int, gpu_batch: int, cmd_q, result_q, log_prefix: str):
+    import signal as _signal
+    _setup_cuda_libs()
+    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+
+    try:
+        from gpu_solver import GPUSolver
+        gpu = GPUSolver(batch_size=gpu_batch, device_id=gpu_id)
+        print(f"{log_prefix} ready ({gpu.gpu_name})", flush=True)
+    except Exception as e:
+        print(f"{log_prefix} init failed: {e}", flush=True)
+        result_q.put(("init_fail", gpu_id, str(e)))
+        return
+
+    while True:
+        cmd = cmd_q.get()
+        if cmd is None or cmd[0] == "stop":
+            return
+
+        if cmd[0] == "solve":
+            _, job_id, challenge, target, nonce_base, stop_event = cmd
+            start = time.time()
+
+            def should_stop():
+                return stop_event.is_set()
+
+            nonce, hashes = gpu.solve_range(challenge, target, nonce_base, should_stop)
+            elapsed = time.time() - start
+            if nonce is not None:
+                result_q.put(("found", job_id, gpu_id, nonce, hashes, elapsed))
+            else:
+                result_q.put(("done", job_id, gpu_id, hashes, elapsed))
+
+
+def _run_cooperative(gpu_ids, wallet_keys, gpu_batch):
+    import multiprocessing as mp
+    from web3 import Web3
+    from eth_account import Account
+    from wallets import Wallet, WalletPool
+
+    w3_local = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
+    globals()["w3"] = w3_local
+    contract = load_contract(w3_local)
+
+    wallets_obj = [Wallet(Account.from_key(k), source=f"coop-{i}") for i, k in enumerate(wallet_keys)]
+    pool = WalletPool(wallets_obj)
+
+    ctx = mp.get_context("spawn")
+    cmd_qs = [ctx.Queue() for _ in gpu_ids]
+    result_q = ctx.Queue()
+    stop_events = [ctx.Event() for _ in gpu_ids]
+
+    procs = []
+    for i, gid in enumerate(gpu_ids):
+        prefix = f"[GPU#{gid}]"
+        p = ctx.Process(target=_coop_gpu_worker, args=(gid, gpu_batch, cmd_qs[i], result_q, prefix), daemon=False)
+        p.start()
+        procs.append(p)
+
+    print(f"🤝 Cooperative mode: {len(gpu_ids)} GPUs on 1 wallet per round", flush=True)
+
+    import random
+    coordinator_running = {"v": True}
+
+    def _stop(sig, frame):
+        coordinator_running["v"] = False
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    round_num = 0
+    mints = 0
+    pfft_total = 0.0
+    start_session = time.time()
+
+    try:
+        while coordinator_running["v"]:
+            round_num += 1
+            wo = pool.next_available()
+            if wo is None:
+                if not pool.available():
+                    print("All wallets exhausted. Stopping.")
+                    break
+                time.sleep(5)
+                continue
+
+            wallet = wo.account
+            try:
+                s = get_status(contract, wallet.address)
+                if s['total_minted'] >= s['max_supply']:
+                    print("Max supply reached.")
+                    break
+                if s['wallet_minted'] >= WALLET_CAP_PFFT * 1e18:
+                    print(f"Wallet {wallet.address[:10]}... capped.")
+                    wo.skip(10**9, "capped")
+                    continue
+                eth_bal = w3_local.eth.get_balance(wallet.address) / 1e18
+                if eth_bal < MIN_ETH_FOR_MINT:
+                    print(f"{wallet.address[:10]}... low ETH ({eth_bal:.6f}), skip 5min")
+                    wo.skip(300, "no_eth")
+                    continue
+            except Exception as e:
+                print(f"Status error: {e}")
+                time.sleep(15)
+                continue
+
+            challenge = get_challenge(contract, wallet.address)
+            print(f"\n🎯 Round #{round_num} | wallet {wallet.address[:10]}... | {s['difficulty_bits']}-bit | ALL {len(gpu_ids)} GPUs")
+
+            stride = 1 << 56
+            base = random.randint(0, (1 << 63) - 1)
+
+            for ev in stop_events:
+                ev.clear()
+
+            job_id = round_num
+            for i, gid in enumerate(gpu_ids):
+                nb = (base + i * stride) & ((1 << 64) - 1)
+                cmd_qs[i].put(("solve", job_id, challenge, s['target'], nb, stop_events[i]))
+
+            found_nonce = None
+            winner_gpu = None
+            finished = 0
+            t_start = time.time()
+            last_report = t_start
+
+            while finished < len(gpu_ids):
+                try:
+                    msg = result_q.get(timeout=2.0)
+                except Exception:
+                    now = time.time()
+                    if now - last_report >= 3.0:
+                        print(f"  ⏳ mining... {now - t_start:.0f}s", end="\r", flush=True)
+                        last_report = now
+                    continue
+
+                kind = msg[0]
+                if kind == "found" and msg[1] == job_id and found_nonce is None:
+                    _, _, winner_gpu, nonce, hashes, el = msg
+                    found_nonce = nonce
+                    print(f"\n  ✅ GPU#{winner_gpu} found nonce={nonce} in {el:.1f}s ({hashes:,} hashes)")
+                    for ev in stop_events:
+                        ev.set()
+                elif kind == "done" and msg[1] == job_id:
+                    finished += 1
+                elif kind == "found" and msg[1] == job_id:
+                    finished += 1
+
+            if found_nonce is None:
+                print("  ⚠️  No nonce found this round (aborted?)")
+                continue
+
+            try:
+                if not contract.functions.isValidPow(wallet.address, found_nonce).call():
+                    print("  ⚠️  Nonce stale, retrying round")
+                    continue
+            except Exception:
+                pass
+
+            if submit_mint(w3_local, wallet, contract, found_nonce):
+                mints += 1
+                earned = s['next_mint'] / 1e18
+                pfft_total += earned
+                wo.mints_this_session += 1
+                wo.pfft_earned += earned
+                print(f"  💰 +{earned:,.2f} PFFT | Session total: {pfft_total:,.2f} ({mints} mints)")
+
+            if coordinator_running["v"]:
+                time.sleep(PAUSE_BETWEEN_ROUNDS)
+    finally:
+        for q in cmd_qs:
+            q.put(("stop",))
+        for p in procs:
+            p.join(timeout=5)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+
+    elapsed = time.time() - start_session
+    print(f"\n{'='*60}")
+    print(f"  Cooperative session done: {mints} mints, {pfft_total:,.2f} PFFT in {elapsed/60:.1f} min")
+    print(f"{'='*60}")
+
+
 def _detect_gpus():
     import subprocess
     try:
@@ -406,14 +589,23 @@ def main():
     print(f"   Next mint: ~{s['next_mint']/1e18:,.2f} PFFT")
     print(f"   Difficulty: {s['hex_zeros']} hex zeros ({s['difficulty_bits']}-bit)")
 
-    num_workers = len(gpu_ids) if gpu_ids else 1
+    num_gpus = len(gpu_ids) if gpu_ids else 0
+    num_wallets = len(pool)
     all_keys = ["0x" + w.account.key.hex() if not w.account.key.hex().startswith("0x") else w.account.key.hex()
                 for w in pool.wallets]
+
+    if num_gpus > 0 and num_wallets < num_gpus:
+        print(f"\n🤝 Cooperative mode: {num_wallets} wallet(s) < {num_gpus} GPUs")
+        print(f"   All GPUs will mine the same challenge in parallel (first-to-find wins)")
+        _run_cooperative(gpu_ids, all_keys, GPU_BATCH)
+        return
+
+    num_workers = num_gpus if num_gpus else 1
     buckets = [[] for _ in range(num_workers)]
     for idx, k in enumerate(all_keys):
         buckets[idx % num_workers].append(k)
 
-    print(f"\n🔧 Spawning {num_workers} worker process(es):")
+    print(f"\n🔧 Parallel mode: spawning {num_workers} worker process(es):")
     for i, b in enumerate(buckets):
         gid = gpu_ids[i] if gpu_ids else -1
         tag = f"GPU#{gid}" if gid >= 0 else "CPU"

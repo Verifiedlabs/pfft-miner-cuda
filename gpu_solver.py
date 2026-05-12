@@ -196,6 +196,43 @@ class GPUSolver:
         props = cp.cuda.runtime.getDeviceProperties(device_id)
         self.gpu_name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
 
+    def solve_range(self, challenge: bytes, target: int, nonce_base: int,
+                    should_stop, max_hashes: int = None) -> tuple:
+        assert len(challenge) == 32
+
+        c0 = cp.uint64(_u64_le(challenge[0:8]))
+        c1 = cp.uint64(_u64_le(challenge[8:16]))
+        c2 = cp.uint64(_u64_le(challenge[16:24]))
+        c3 = cp.uint64(_u64_le(challenge[24:32]))
+
+        tb = target.to_bytes(32, "big")
+        t0 = cp.uint64(_u64_be(tb[0:8]))
+        t1 = cp.uint64(_u64_be(tb[8:16]))
+        t2 = cp.uint64(_u64_be(tb[16:24]))
+        t3 = cp.uint64(_u64_be(tb[24:32]))
+
+        found_flag = cp.zeros(1, dtype=cp.int32)
+        found_nonce = cp.zeros(1, dtype=cp.uint64)
+
+        offset = 0
+        while not should_stop():
+            if max_hashes is not None and offset >= max_hashes:
+                return None, offset
+
+            current = (nonce_base + offset) & ((1 << 64) - 1)
+            self.kernel(
+                (self.blocks,), (self.threads,),
+                (c0, c1, c2, c3, t0, t1, t2, t3, cp.uint64(current), found_flag, found_nonce)
+            )
+            cp.cuda.Stream.null.synchronize()
+
+            if int(found_flag[0]) != 0:
+                return int(found_nonce[0]), offset + self.batch_size
+
+            offset += self.batch_size
+
+        return None, offset
+
     def solve(self, challenge: bytes, target: int, running_flag) -> tuple:
         assert len(challenge) == 32
 
