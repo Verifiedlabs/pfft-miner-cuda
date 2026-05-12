@@ -198,8 +198,37 @@ signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
 
+def _setup_cuda_libs():
+    import os
+    import ctypes
+    import glob
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("nvidia.cuda_nvrtc")
+        if not spec or not spec.submodule_search_locations:
+            return
+        lib_dir = os.path.join(spec.submodule_search_locations[0], "lib")
+        if not os.path.isdir(lib_dir):
+            return
+
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        if lib_dir not in existing.split(":"):
+            os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else lib_dir
+
+        for pattern in ("libnvrtc-builtins.so*", "libnvrtc.so*"):
+            for f in sorted(glob.glob(os.path.join(lib_dir, pattern)), reverse=True):
+                try:
+                    ctypes.CDLL(f, mode=ctypes.RTLD_GLOBAL)
+                    break
+                except OSError:
+                    continue
+    except Exception:
+        pass
+
+
 def _worker_mine(gpu_id: int, wallet_keys: list, gpu_batch: int, use_gpu: bool, log_prefix: str):
     import signal as _signal
+    _setup_cuda_libs()
     from web3 import Web3
     from eth_account import Account
     from wallets import Wallet, WalletPool
