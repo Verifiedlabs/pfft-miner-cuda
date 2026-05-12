@@ -37,6 +37,9 @@ GAS_LIMIT = 200000
 PAUSE_BETWEEN_ROUNDS = 5
 USE_GPU = os.environ.get("PFFT_GPU", "1") not in ("0", "false", "False", "")
 GPU_BATCH = int(os.environ.get("PFFT_GPU_BATCH", 1 << 22))
+AUTO_CREATE_WALLETS = int(os.environ.get("PFFT_AUTO_CREATE_WALLETS", 1))
+MIN_ETH_FOR_MINT = 0.00005
+WALLET_CAP_PFFT = 10_000
 
 # ---------------------------------------------------------------------------
 # Keccak256 (fast, using pycryptodome C extension)
@@ -224,48 +227,23 @@ def main():
         sys.exit(1)
     print(f"✅ Connected | Block #{w3.eth.block_number}")
 
-    # Load/create wallet
-    wallet_path = Path(WALLET_FILE)
-    if wallet_path.exists():
-        with open(wallet_path) as f:
-            wdata = json.load(f)
-        pk = wdata.get('private_key_hex') or wdata.get('private_key')
-        if not pk.startswith('0x'):
-            pk = '0x' + pk
-        wallet = Account.from_key(pk)
-        print(f"✅ Wallet: {wallet.address}")
-    else:
-        wallet = Account.create()
-        wdata = {
-            "address": wallet.address,
-            "private_key_hex": wallet.key.hex(),
-            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "note": "PFFT miner wallet — KEEP SECRET"
-        }
-        wallet_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(wallet_path, 'w') as f:
-            json.dump(wdata, f, indent=2)
-        os.chmod(wallet_path, 0o600)
-        print(f"✅ New wallet: {wallet.address}")
-        print(f"   Saved: {wallet_path}")
+    from wallets import load_wallets
+    pool = load_wallets(Account, WALLET_FILE, auto_create_count=AUTO_CREATE_WALLETS)
+    print(f"\n👛 Loaded {len(pool)} wallet(s):")
+    for w in pool.wallets:
+        eth_bal = w3.eth.get_balance(w.address) / 1e18
+        marker = "⚠️ " if eth_bal < MIN_ETH_FOR_MINT else "  "
+        print(f"   {marker}{w.address}  ETH: {eth_bal:.6f}")
 
-    # ETH balance
-    eth_bal = w3.eth.get_balance(wallet.address) / 1e18
-    print(f"💰 ETH: {eth_bal:.6f}")
-    if eth_bal < 0.00005:
-        print("⚠️  Low ETH! Need ~0.00005+ ETH for gas")
-
-    # Contract
     contract = load_contract(w3)
-    s = get_status(contract, wallet.address)
+
+    head = pool.wallets[0]
+    s = get_status(contract, head.address)
     print(f"\n📊 Contract:")
     print(f"   Minted: {s['total_minted']/1e18:,.0f} / {s['max_supply']/1e18:,.0f} PFFT ({s['progress']:.1f}%)")
     print(f"   Next mint: ~{s['next_mint']/1e18:,.2f} PFFT")
     print(f"   Difficulty: {s['hex_zeros']} hex zeros ({s['difficulty_bits']}-bit)")
-    print(f"   Wallet minted: {s['wallet_minted']/1e18:,.2f} / 10,000 PFFT")
-    print(f"   Wallet balance: {s['wallet_bal']/1e18:,.2f} PFFT")
 
-    # Mining loop
     round_num = 0
     total_minted_count = 0
     total_pfft_earned = 0
@@ -273,11 +251,21 @@ def main():
 
     while running:
         round_num += 1
+
+        wallet_obj = pool.next_available()
+        if wallet_obj is None:
+            avail = pool.available()
+            if not avail:
+                print("\n  🏁 All wallets are skipped/capped. Ending session.")
+                break
+            time.sleep(5)
+            continue
+
+        wallet = wallet_obj.account
         print(f"\n{'─'*60}")
-        print(f"  Round #{round_num}")
+        print(f"  Round #{round_num} — wallet {wallet.address[:10]}... ({pool.wallets.index(wallet_obj)+1}/{len(pool)})")
         print(f"{'─'*60}")
 
-        # Refresh status
         try:
             s = get_status(contract, wallet.address)
             print(f"  Supply: {s['total_minted']/1e18:,.0f} ({s['progress']:.1f}%) | "
@@ -287,18 +275,23 @@ def main():
             if s['total_minted'] >= s['max_supply']:
                 print("  🏁 Max supply reached!")
                 break
-            if s['wallet_minted'] >= 10_000 * 1e18:
-                print("  🏁 Wallet cap (10,000 PFFT) reached!")
-                break
+            if s['wallet_minted'] >= WALLET_CAP_PFFT * 1e18:
+                print(f"  🏁 Wallet capped ({WALLET_CAP_PFFT:,} PFFT). Skipping permanently.")
+                wallet_obj.skip(10**9, "capped")
+                continue
+
+            eth_bal = w3.eth.get_balance(wallet.address) / 1e18
+            if eth_bal < MIN_ETH_FOR_MINT:
+                print(f"  ⚠️  ETH too low ({eth_bal:.6f}). Skipping for 5 min.")
+                wallet_obj.skip(300, "no_eth")
+                continue
         except Exception as e:
             print(f"  ⚠️  Status error: {e}, retrying in 15s...")
             time.sleep(15)
             continue
 
-        # Get challenge
         challenge = get_challenge(contract, wallet.address)
 
-        # Solve PoW
         print(f"  ⛏️  Mining ({s['difficulty_bits']}-bit)...")
         t0 = time.time()
         if gpu is not None:
@@ -312,7 +305,6 @@ def main():
 
         mining_time = time.time() - t0
 
-        # Verify before submitting
         try:
             is_valid = contract.functions.isValidPow(wallet.address, nonce).call()
             if not is_valid:
@@ -321,26 +313,18 @@ def main():
         except Exception as e:
             print(f"  ⚠️  Verify error: {e}, submitting anyway...")
 
-        # Submit mint
         success = submit_mint(w3, wallet, contract, nonce)
         if success:
             total_minted_count += 1
             earned = s['next_mint'] / 1e18
             total_pfft_earned += earned
-            print(f"  💰 +{earned:,.2f} PFFT | Total: {total_pfft_earned:,.2f} PFFT from {total_minted_count} mints")
+            wallet_obj.mints_this_session += 1
+            wallet_obj.pfft_earned += earned
+            print(f"  💰 +{earned:,.2f} PFFT | Wallet total: {wallet_obj.pfft_earned:,.2f} | Session: {total_pfft_earned:,.2f} from {total_minted_count} mints across {len(pool)} wallet(s)")
 
-            # Check new balance
-            try:
-                bal = contract.functions.balanceOf(wallet.address).call()
-                print(f"  💰 PFFT balance: {bal/1e18:,.2f}")
-            except:
-                pass
-
-        # Summary
         elapsed = time.time() - global_start
         print(f"\n  📈 Session: {total_minted_count} mints | {total_pfft_earned:,.2f} PFFT | {elapsed/60:.1f} min")
 
-        # Pause
         if running:
             print(f"  ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")
             time.sleep(PAUSE_BETWEEN_ROUNDS)
@@ -350,6 +334,10 @@ def main():
     print(f"  Mints: {total_minted_count}")
     print(f"  PFFT earned: {total_pfft_earned:,.2f}")
     print(f"  Runtime: {(time.time()-global_start)/60:.1f} min")
+    print(f"\n  Per-wallet breakdown:")
+    for w in pool.wallets:
+        if w.mints_this_session > 0:
+            print(f"    {w.address}: {w.mints_this_session} mints, {w.pfft_earned:,.2f} PFFT")
     print(f"{'='*60}")
 
 

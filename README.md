@@ -67,12 +67,48 @@ python3 pfft_miner.py
 
 First run auto-generates `wallet.json` with a fresh Ethereum wallet. Fund it with ~0.001 ETH (enough for ~50 mints) and run again.
 
+## Multi-wallet support
+
+Run the miner against a pool of wallets — each round rotates to the next wallet. Wallets that run out of ETH or hit the 10,000 PFFT cap are auto-skipped.
+
+### Auto-generate N wallets
+
+```bash
+mkdir wallets
+PFFT_WALLETS_DIR=./wallets PFFT_AUTO_CREATE_WALLETS=5 python3 pfft_miner.py
+```
+
+First run creates `wallets/wallet_1.json` … `wallet_5.json`. Fund each address with ETH, then re-run.
+
+### Import existing wallets
+
+Drop any number of wallet files into the directory:
+
+```
+wallets/
+├── main.json          # {"private_key_hex": "0xabc..."}
+├── alt1.json
+└── alt2.json
+```
+
+Each file just needs a `private_key_hex` field. The miner picks them all up and rotates.
+
+### Skip rules
+
+| Condition | Action |
+|---|---|
+| ETH balance < 0.00005 | Skip for 5 min, retry later |
+| Wallet minted ≥ 10,000 PFFT | Skip permanently (capped) |
+| All wallets skipped | End session |
+
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ETH_RPC` | `https://ethereum-rpc.publicnode.com` | Ethereum RPC endpoint |
-| `PFFT_WALLET` | `./wallet.json` | Wallet JSON path |
+| `PFFT_WALLET` | `./wallet.json` | Single wallet JSON path |
+| `PFFT_WALLETS_DIR` | _(unset)_ | **Multi-wallet mode.** Directory containing `*.json` wallet files |
+| `PFFT_AUTO_CREATE_WALLETS` | `1` | Auto-create N wallets when `PFFT_WALLETS_DIR` is empty |
 | `PFFT_GPU` | `1` | Set `0` to force CPU fallback |
 | `PFFT_GPU_BATCH` | `16777216` | GPU batch size (2^24). Raise to `33554432` on 3080+ |
 
