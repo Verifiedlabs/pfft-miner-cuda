@@ -188,7 +188,7 @@ class GPUSolver:
     def __init__(self, batch_size: int = 1 << 24, threads_per_block: int = 256, device_id: int = 0):
         self.device_id = device_id
         cp.cuda.Device(device_id).use()
-        self.module = cp.RawModule(code=_CUDA_KERNEL, backend="nvcc")
+        self.module = cp.RawModule(code=_CUDA_KERNEL, backend="nvrtc", options=("-std=c++17",))
         self.kernel = self.module.get_function("mine_kernel")
         self.batch_size = batch_size
         self.threads = threads_per_block

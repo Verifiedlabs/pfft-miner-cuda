@@ -6,21 +6,26 @@ if ! command -v python3 >/dev/null; then
     exit 1
 fi
 
-if ! command -v nvcc >/dev/null; then
-    echo "WARNING: nvcc not found."
-    echo "Install CUDA Toolkit 12.x:"
-    echo "  https://developer.nvidia.com/cuda-downloads"
-    echo ""
-    echo "Then add to ~/.bashrc:"
-    echo "  export PATH=/usr/local/cuda/bin:\$PATH"
-    echo "  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+if ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: nvidia-smi not working. NVIDIA driver missing."
+    echo "Install driver: sudo ubuntu-drivers autoinstall && sudo reboot"
     exit 1
 fi
 
-if ! nvidia-smi >/dev/null 2>&1; then
-    echo "nvidia-smi not working. Install NVIDIA driver:"
-    echo "  sudo ubuntu-drivers autoinstall"
-    exit 1
+echo "GPU detected:"
+nvidia-smi -L
+
+if ! command -v nvcc >/dev/null; then
+    echo ""
+    echo "INFO: nvcc not in PATH."
+    echo "Not strictly required — CuPy uses NVRTC (bundled with driver) to JIT kernels."
+    echo "If install fails, install CUDA Toolkit:"
+    echo "  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+    echo "  sudo dpkg -i cuda-keyring_1.1-1_all.deb"
+    echo "  sudo apt update && sudo apt install -y cuda-toolkit-12-6"
+    echo ""
+    echo "Continuing install (pip wheels)..."
+    echo ""
 fi
 
 python3 -m pip install --upgrade pip
