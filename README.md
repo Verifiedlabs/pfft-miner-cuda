@@ -21,42 +21,49 @@ Contract: `0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB`
 
 Numbers are ballpark. Actual depends on clocks, power limit, and batch size.
 
-## Requirements (Windows)
+## Requirements
 
-1. **NVIDIA GPU** with CUDA compute capability 3.5+ (anything RTX 20/30/40 works)
-2. **Python 3.10+** — https://python.org (check "Add to PATH" during install)
-3. **CUDA Toolkit 12.x** — https://developer.nvidia.com/cuda-downloads
-4. **Visual Studio Build Tools** (MSVC compiler — required by CUDA/CuPy)
-   - https://visualstudio.microsoft.com/visual-cpp-build-tools/
-   - Install workload: "Desktop development with C++"
+**Windows:**
+1. NVIDIA GPU, compute capability 3.5+ (anything RTX 20/30/40 works)
+2. [Python 3.10+](https://python.org) — check "Add to PATH" during install
+3. [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads)
+4. [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with "Desktop development with C++" workload
 
-Verify install:
-```cmd
-nvcc --version
-python --version
+**Ubuntu / Linux:**
+1. NVIDIA GPU + NVIDIA driver (`sudo ubuntu-drivers autoinstall`)
+2. Python 3.10+ (`sudo apt install python3 python3-pip python3-venv`)
+3. CUDA Toolkit 12.x ([official repo instructions](https://developer.nvidia.com/cuda-downloads?target_os=Linux))
+4. Build essentials (`sudo apt install build-essential`)
+
+Verify:
+```bash
+nvidia-smi        # shows GPU
+nvcc --version    # shows CUDA 12.x
+python3 --version
 ```
 
 ## Setup
 
+### Windows
+
 ```cmd
-git clone https://github.com/<your-user>/pfft-miner-cuda.git
+git clone https://github.com/Verifiedlabs/pfft-miner-cuda.git
 cd pfft-miner-cuda
-
 install.bat
-```
-
-Or manually:
-```cmd
-pip install -r requirements.txt
-```
-
-## Run
-
-```cmd
 python pfft_miner.py
 ```
 
 Or double-click `run.bat`.
+
+### Ubuntu / Linux
+
+```bash
+git clone https://github.com/Verifiedlabs/pfft-miner-cuda.git
+cd pfft-miner-cuda
+chmod +x install.sh
+./install.sh
+python3 pfft_miner.py
+```
 
 First run auto-generates `wallet.json` with a fresh Ethereum wallet. Fund it with ~0.001 ETH (enough for ~50 mints) and run again.
 
@@ -69,10 +76,21 @@ First run auto-generates `wallet.json` with a fresh Ethereum wallet. Fund it wit
 | `PFFT_GPU` | `1` | Set `0` to force CPU fallback |
 | `PFFT_GPU_BATCH` | `16777216` | GPU batch size (2^24). Raise to `33554432` on 3080+ |
 
-Set via `set` before launch, or create `.env`:
-```cmd
-set PFFT_GPU_BATCH=33554432
-python pfft_miner.py
+Set via env var before launch, or create `.env`:
+```bash
+export PFFT_GPU_BATCH=33554432   # Linux
+set PFFT_GPU_BATCH=33554432      # Windows cmd
+python3 pfft_miner.py
+```
+
+## Run as systemd service (Linux)
+
+```bash
+sudo cp pfft-miner.service /etc/systemd/system/pfft-miner@$USER.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pfft-miner@$USER
+
+sudo journalctl -u pfft-miner@$USER -f
 ```
 
 ## Batch size tuning
@@ -95,19 +113,27 @@ Higher batch = better throughput but slower Ctrl+C response.
 
 ## Troubleshooting
 
-**`nvcc fatal: Cannot find compiler 'cl.exe'`**
-→ Install Visual Studio Build Tools with C++ workload. Open "x64 Native Tools Command Prompt for VS" and run from there.
+**Windows: `nvcc fatal: Cannot find compiler 'cl.exe'`**
+→ Install Visual Studio Build Tools with C++ workload. Launch from "x64 Native Tools Command Prompt for VS".
+
+**Linux: `nvcc not found`**
+→ Add CUDA to PATH in `~/.bashrc`:
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+```
+Then `source ~/.bashrc`.
 
 **`CUDA driver version is insufficient`**
-→ Update NVIDIA driver. CUDA 12.x needs driver 525+.
+→ Update NVIDIA driver. CUDA 12.x needs driver 525+. On Ubuntu: `sudo ubuntu-drivers autoinstall`.
 
 **`ModuleNotFoundError: No module named 'cupy'`**
-→ Run `pip install cupy-cuda12x`. If you have CUDA 11, use `cupy-cuda11x` instead.
+→ `pip install cupy-cuda12x`. If you have CUDA 11, use `cupy-cuda11x` instead.
 
 **GPU utilization low (<80%)**
-→ Raise `PFFT_GPU_BATCH`. Also close other GPU workloads (games, browsers with hardware accel).
+→ Raise `PFFT_GPU_BATCH`. Close other GPU workloads (games, browsers with hardware accel).
 
-**`ValueError: Insufficient ETH for gas`**
+**`Insufficient ETH for gas`**
 → Wallet needs ~0.00005 ETH per mint. Send ETH to the address printed on startup.
 
 ## License
