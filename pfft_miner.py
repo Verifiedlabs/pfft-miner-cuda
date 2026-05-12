@@ -298,21 +298,37 @@ def _worker_mine(gpu_id: int, wallet_keys: list, gpu_batch: int, use_gpu: bool, 
 
 
 def _detect_gpus():
+    import subprocess
     try:
-        import cupy as cp
-        n = cp.cuda.runtime.getDeviceCount()
-        names = []
-        for i in range(n):
-            p = cp.cuda.runtime.getDeviceProperties(i)
-            names.append(p["name"].decode() if isinstance(p["name"], bytes) else str(p["name"]))
-        return list(range(n)), names
+        out = subprocess.check_output(["nvidia-smi", "-L"], text=True, timeout=10)
     except Exception as e:
-        print(f"⚠️  GPU detection failed: {e}")
+        print(f"⚠️  nvidia-smi failed: {e}")
         return [], []
+
+    ids = []
+    names = []
+    for line in out.strip().splitlines():
+        line = line.strip()
+        if not line.startswith("GPU "):
+            continue
+        try:
+            head, rest = line.split(":", 1)
+            idx = int(head.replace("GPU", "").strip())
+            name = rest.split("(UUID:")[0].strip()
+            ids.append(idx)
+            names.append(name)
+        except Exception:
+            continue
+    return ids, names
 
 
 def main():
     import multiprocessing as mp
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
     from web3 import Web3
     from eth_account import Account
 
